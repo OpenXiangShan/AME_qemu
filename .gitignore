@@ -1,8 +1,13 @@
 /GNUmakefile
 /build/
 /roms/hexagon-firmware-build/
+/build-ci/
+/ci-results/
 /.cache/
 /.vscode/
+/toolchain/install/
+/toolchain/.install-stage.*/
+/toolchain/.install-backup.*/
 *.pyc
 .sdk
 .stgit-*

@@ -1,0 +1,439 @@
+# Copyright (c) 2026 BOSC & ICT, CAS
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'all, ame-regression, riscv64-checks, or a profile from github_ci.py list'
+        type: string
+        default: all
+      functional:
+        description: 'Download public guest assets and run extended functional tests'
+        type: boolean
+        default: true
+      experimental:
+        description: 'Also run upstream flaky and disabled CFI profiles'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      linux: ${{ steps.matrix.outputs.linux }}
+      native: ${{ steps.matrix.outputs.native }}
+      has_linux: ${{ steps.matrix.outputs.has_linux }}
+      has_native: ${{ steps.matrix.outputs.has_native }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Check CI adapter
+        run: python3 -m unittest discover -s scripts/ci -p test_github_ci.py -v
+      - name: Select build profiles
+        id: matrix
+        env:
+          PROFILE: ${{ inputs.profile || 'all' }}
+          EXPERIMENTAL: ${{ inputs.experimental || false }}
+        run: |
+          args=(--profile "$PROFILE")
+          if [[ "$EXPERIMENTAL" == true ]]; then
+            args+=(--experimental)
+          fi
+          python3 scripts/ci/github_ci.py matrix "${args[@]}"
+
+  linux:
+    name: ${{ matrix.profile }}
+    needs: plan
+    if: needs.plan.outputs.has_linux == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    continue-on-error: ${{ matrix.advisory }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Build environment and run repository checks
+        env:
+          PROFILE: ${{ matrix.profile }}
+          FUNCTIONAL: ${{ github.event_name != 'workflow_dispatch' || inputs.functional }}
+        run: |
+          args=()
+          if [[ "$FUNCTIONAL" != true ]]; then
+            args+=(--no-functional)
+          fi
+          python3 scripts/ci/github_ci.py run "$PROFILE" "${args[@]}"
+      - name: Upload logs and reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.profile }}-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            build-ci/ci-logs/
+            build-ci/config.log
+            build-ci/meson-logs/
+            build-ci/previous-source/build/meson-logs/
+            build-ci/coverage.xml
+            build-ci/docs-install/usr/local/share/doc/
+            build-ci/tests/functional/**/*.log
+            build-ci/tests/qemu-iotests/**/*.bad
+            build-ci/qemu-setup*.exe
+            ci-results/
+            HTML/
+            build-oss-fuzz/meson-logs/
+
+  native:
+    name: ${{ matrix.profile }}
+    needs: plan
+    if: needs.plan.outputs.has_native == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.native) }}
+    env:
+      PROFILE: ${{ matrix.profile }}
+      MSYSTEM: MINGW64
+      CHERE_INVOKING: 'yes'
+      CI_JOBS: '2'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Install macOS build and guest toolchains
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash bc bindgen bison ccache coreutils ctags dtc gettext \
+            glib gnutls libslirp llvm make meson ninja pixman pkgconf \
+            python-setuptools python3 rust zlib zstd \
+            arm-none-eabi-gcc aarch64-elf-gcc i686-elf-gcc x86_64-elf-gcc
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          echo "MAKE=gmake" >> "$GITHUB_ENV"
+      - name: Install Windows MSYS2 build dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm -Syuu'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm -Syuu'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm -S --needed bison diffutils flex git grep make sed mingw-w64-x86_64-gcc mingw-w64-x86_64-glib2 mingw-w64-x86_64-libnfs mingw-w64-x86_64-libssh mingw-w64-x86_64-ninja mingw-w64-x86_64-pixman mingw-w64-x86_64-pkgconf mingw-w64-x86_64-python mingw-w64-x86_64-python-setuptools mingw-w64-x86_64-python-wheel mingw-w64-x86_64-rust mingw-w64-x86_64-rust-bindgen mingw-w64-x86_64-zstd'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and run native checks
+        shell: ${{ matrix.shell }}
+        run: python3 scripts/ci/github_ci.py run "$PROFILE"
+      - name: Upload native logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.profile }}-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            build-ci/ci-logs/
+            build-ci/config.log
+            build-ci/meson-logs/
+
+  python:
+    name: python-${{ matrix.version }}-${{ matrix.mode }}
+    if: github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'python'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: '3.12'
+            mode: minreqs
+          - version: '3.12'
+            mode: dev
+          - version: '3.13'
+            mode: dev
+          - version: '3.14'
+            mode: dev
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Run existing Python lint tests
+        env:
+          PYTHON_VERSION: ${{ matrix.version }}
+          MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p build-ci
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" \
+            -e MODE="$MODE" "python:$PYTHON_VERSION-bookworm" \
+            sh -ec 'apt-get update && apt-get install -y --no-install-recommends make git libfuse2; make -C python "check-$MODE"' \
+            2>&1 | tee build-ci/python.log
+      - name: Upload Python log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-${{ matrix.version }}-${{ matrix.mode }}-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: build-ci/python.log
+
+  commits:
+    name: check-${{ matrix.mode }}
+    if: github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'commits'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.mode == 'patch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [dco, patch]
+    steps:
+      - name: Check out contribution history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
+      - name: Check contribution commits
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p build-ci
+          python3 scripts/ci/github_ci.py commits "$MODE" 2>&1 | tee build-ci/commits.log
+      - name: Upload commit check log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: commits-${{ matrix.mode }}-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: build-ci/commits.log
+
+  riscv64-checks:
+    if: github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'riscv64-checks'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev libfdt-dev zlib1g-dev \
+            gcc-riscv64-linux-gnu libc6-dev-riscv64-cross gdb-multiarch
+
+      - name: Configure RV64 emulators
+        run: |
+          mkdir -p build-ci
+          cd build-ci
+          ../configure \
+            --target-list=riscv64-softmmu,riscv64-linux-user \
+            --cross-cc-riscv64=riscv64-linux-gnu-gcc \
+            --gdb=gdb-multiarch \
+            --enable-download \
+            --enable-fdt=system \
+            --enable-plugins \
+            --enable-werror \
+            --disable-docs \
+            --disable-rust 2>&1 | tee configure.log
+
+      - name: Verify TCG test configuration
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          build = Path('build-ci')
+          info = build / 'meson-info'
+          options = {item['name']: item['value'] for item in
+                     json.loads((info / 'intro-buildoptions.json').read_text())}
+          tests = json.loads((info / 'intro-tests.json').read_text())
+          targets = json.loads((info / 'intro-targets.json').read_text())
+          assert options['plugins'] is True, 'TCG plugins are disabled'
+          assert options['tcg_tests_cross_cc_riscv64'] == 'riscv64-linux-gnu-gcc'
+          assert Path(options['gdb']).name == 'gdb-multiarch'
+          for target in ('riscv64-linux-user', 'riscv64-softmmu'):
+              assert (build / f'{target}-config-target.h').is_file(), target
+              registered = [test for test in tests
+                            if f'qemu:tcg-{target}' in test['suite']]
+              assert registered, f'No TCG tests registered for {target}'
+              assert any('-plugin' in test['cmd'] for test in registered), target
+              guests = [item for item in targets
+                        if item['name'].startswith(target + '-')
+                        and item['name'].endswith('.test')]
+              assert guests, f'No guest binaries configured for {target}'
+              for guest in guests:
+                  assert any(source['compiler']
+                             and Path(source['compiler'][0]).name == 'riscv64-linux-gnu-gcc'
+                             and '-static' in source['compiler']
+                             for source in guest['target_sources']), guest['name']
+              print(f'{target}: {len(registered)} TCG tests, {len(guests)} static guests')
+          assert any('--gdb' in test['cmd'] and
+                     Path(test['cmd'][test['cmd'].index('--gdb') + 1]).name == 'gdb-multiarch'
+                     for test in tests if test['name'].startswith('riscv64-'))
+          PY
+
+      - name: Build QEMU and test plugins
+        id: build
+        run: make -C build-ci -j2 all test-plugins 2>&1 | tee build-ci/build.log
+
+      - name: Run default regression tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -C build-ci -j2 check 2>&1 | tee build-ci/check.log
+
+      - name: Run RV64 user and system TCG tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -C build-ci -j2 check-tcg V=1 2>&1 | tee build-ci/check-tcg.log
+
+      - name: Upload build and test logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: riscv64-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            build-ci/*.log
+            build-ci/meson-logs/
+            build-ci/tests/tcg/**/*.out
+            build-ci/tests/tcg/**/*.pout
+            build-ci/tests/tcg/**/*.err
+            build-ci/tests/functional/**/*.log
+            build-ci/tests/qemu-iotests/**/*.bad
+
+  ame-regression:
+    if: github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'ame-regression'
+    runs-on: [self-hosted, bosc, open]
+    timeout-minutes: 240
+    env:
+      AME_TEST_DIR: /nfs/share/ci-runner-RAISA/qemu_run_files/qemu-regression
+      CI_JOBS: '2'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Prepare isolated build and reports
+        run: |
+          ci_dir=$(mktemp -d "$RUNNER_TEMP/ame-regression.XXXXXX")
+          mkdir -p "$ci_dir/build" "$ci_dir/logs" "$ci_dir/results"
+          echo "AME_CI_DIR=$ci_dir" >> "$GITHUB_ENV"
+          git rev-parse HEAD > "$ci_dir/logs/commit.txt"
+
+      - name: Check server dependencies and regression package
+        run: |
+          {
+            for utility in bash cc make ninja pkg-config python3 timeout grep mktemp; do
+              command -v "$utility"
+            done
+            python3 --version
+            pkg-config --modversion glib-2.0
+            test -r "$AME_TEST_DIR/run.sh"
+            test -d "$AME_TEST_DIR/elf"
+            bash -n "$AME_TEST_DIR/run.sh"
+          } 2>&1 | tee "$AME_CI_DIR/logs/environment.log"
+
+      - name: Configure RV64 system emulator
+        working-directory: ${{ env.AME_CI_DIR }}/build
+        run: |
+          "$GITHUB_WORKSPACE/configure" \
+            --target-list=riscv64-softmmu \
+            --without-default-features \
+            --enable-tcg \
+            --enable-fdt=system \
+            --enable-download \
+            --disable-docs \
+            --disable-rust 2>&1 | tee "$AME_CI_DIR/logs/configure.log"
+
+      - name: Build QEMU from this checkout
+        run: |
+          ninja -C "$AME_CI_DIR/build" -j "$CI_JOBS" qemu-system-riscv64 \
+            2>&1 | tee "$AME_CI_DIR/logs/build.log"
+          "$AME_CI_DIR/build/qemu-system-riscv64" --version \
+            2>&1 | tee "$AME_CI_DIR/logs/qemu-version.log"
+
+      - name: Run packaged AME regression tests
+        env:
+          REPORT_DIR: ${{ env.AME_CI_DIR }}/results
+          QEMU_MACHINE: virt
+          QEMU_CPU: max,xame=true
+          QEMU_MEM_SIZE: 128M
+          TIMEOUT_SECONDS: '120'
+        run: |
+          bash "$AME_TEST_DIR/run.sh" "$AME_CI_DIR/build/qemu-system-riscv64" \
+            2>&1 | tee "$AME_CI_DIR/logs/regression.log"
+
+      - name: Summarize AME results
+        if: ${{ always() && env.AME_CI_DIR != '' }}
+        run: |
+          python3 - <<'PYTHON'
+          from collections import Counter
+          import csv
+          import os
+          from pathlib import Path
+
+          reports = sorted((Path(os.environ['AME_CI_DIR']) / 'results').glob('run-*/summary.tsv'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('### AME server regression\n\n')
+              if not reports:
+                  summary.write('No test summary was produced. See the build and environment logs.\n')
+              for report in reports:
+                  with report.open(encoding='utf-8') as stream:
+                      counts = Counter(row['status'] for row in csv.DictReader(stream, delimiter='\t'))
+                  summary.write('| Total | PASS | UNSUPPORTED | FAIL | TIMEOUT |\n')
+                  summary.write('| ---: | ---: | ---: | ---: | ---: |\n')
+                  summary.write('| ' + ' | '.join(str(value) for value in (
+                      sum(counts.values()), *(counts[key] for key in (
+                          'PASS', 'UNSUPPORTED', 'FAIL', 'TIMEOUT')))) + ' |\n\n')
+              summary.write('UNSUPPORTED is accepted by the test package; failures and timeouts fail the job.\n')
+          PYTHON
+
+      - name: Upload AME build and regression logs
+        if: ${{ always() && env.AME_CI_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ame-regression-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ env.AME_CI_DIR }}/logs/
+            ${{ env.AME_CI_DIR }}/results/
+            ${{ env.AME_CI_DIR }}/build/config.log
+            ${{ env.AME_CI_DIR }}/build/meson-logs/
