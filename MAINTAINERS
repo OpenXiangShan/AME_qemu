@@ -388,6 +388,16 @@ F: tests/tcg/riscv32/
 F: tests/tcg/riscv64/
 F: tests/qtest/iommu-riscv-test.c
 
+RISC-V AME (Attached Matrix Extension)
+M: lihaoyan <lihaoyan@bosc.ac.cn>
+M: liukewen <liukewen@bosc.ac.cn>
+M: zhangbosc25 <zhangbosc25@gmail.com>
+S: Maintained
+F: target/riscv/tcg/insn_trans/trans_ame.c.inc
+F: target/riscv/tcg/matrix_helper.c
+F: target/riscv/tcg/ame_*helper.c.inc
+K: \b(AME[_A-Z0-9]*|ame[_a-z0-9]*|xame)\b
+
 RISC-V XThead* extensions
 M: Christoph Muellner <christoph.muellner@vrull.eu>
 M: LIU Zhiwei <zhiwei_liu@linux.alibaba.com>
